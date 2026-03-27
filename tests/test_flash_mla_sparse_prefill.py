@@ -1,3 +1,4 @@
+import os
 import time
 import sys
 
@@ -9,6 +10,73 @@ import lib
 import ref
 
 _counter = kk.Counter()
+
+# Shared with q8 perf test to guarantee q8/q16 perf use the same representative shapes.
+PERFORMANCE_CASE_TEMPLATES = [
+    # V3.2
+    (576, 128, 2048, [8192, 32768, 65536, 98304, 131072]),
+    # MODEL1 CONFIG1
+    (512, 64, 512, [8192, 32768, 49152, 65536]),
+    # MODEL1 CONFIG2
+    (512, 128, 1024, [8192, 32768, 49152, 65536]),
+]
+
+
+def build_performance_cases() -> list[TestParam]:
+    return [
+        TestParam(s_q, s_kv, topk, h_q=h_q, d_qk=d_qk, have_attn_sink=True)
+        for (d_qk, h_q, topk, s_kv_list) in PERFORMANCE_CASE_TEMPLATES
+        for s_q in [4096]
+        for s_kv in s_kv_list
+    ]
+
+
+def _print_precision_details(
+    name: str,
+    ans: torch.Tensor,
+    ref_tensor: torch.Tensor,
+    *,
+    abs_tol: float,
+    rel_tol: float,
+    cos_diff_tol: float,
+) -> None:
+    ans_f = ans.float()
+    ref_f = ref_tensor.float()
+
+    finite_mask = torch.isfinite(ans_f) & torch.isfinite(ref_f)
+    finite_ratio = finite_mask.float().mean().item() if finite_mask.numel() > 0 else 1.0
+    anomaly_mismatch = torch.count_nonzero(torch.isfinite(ans_f) != torch.isfinite(ref_f)).item()
+
+    if finite_mask.any():
+        ans_v = ans_f[finite_mask]
+        ref_v = ref_f[finite_mask]
+        abs_err = (ans_v - ref_v).abs()
+        rel_err = abs_err / (ref_v.abs() + 1e-6)
+        max_abs = abs_err.max().item()
+        mean_abs = abs_err.mean().item()
+        max_rel = rel_err.max().item()
+        mean_rel = rel_err.mean().item()
+        cos_diff = kk.get_cos_diff(ans_v, ref_v)
+    else:
+        max_abs = float("nan")
+        mean_abs = float("nan")
+        max_rel = float("nan")
+        mean_rel = float("nan")
+        cos_diff = float("nan")
+
+    abs_pass = (max_abs <= abs_tol) if finite_mask.any() else False
+    rel_pass = (max_rel <= rel_tol) if finite_mask.any() else False
+    cos_pass = (abs(cos_diff) <= cos_diff_tol) if finite_mask.any() else False
+
+    print(
+        f"[precision][q16] {name}: "
+        f"max_abs={max_abs:.6e} (tol={abs_tol:.6e}, pass={abs_pass}), "
+        f"mean_abs={mean_abs:.6e}, "
+        f"max_rel={max_rel:.6e} (tol={rel_tol:.6e}, pass={rel_pass}), "
+        f"mean_rel={mean_rel:.6e}, "
+        f"cos_diff={cos_diff:.6e} (tol={cos_diff_tol:.6e}, pass={cos_pass}), "
+        f"finite_ratio={finite_ratio:.4f}, anomaly_mismatch={anomaly_mismatch}"
+    )
 
 @torch.inference_mode()
 def run_test(p: TestParam) -> bool:
@@ -41,6 +109,33 @@ def run_test(p: TestParam) -> bool:
         ref_out, ref_out_fp32, ref_max_logits, ref_lse = ref.ref_sparse_attn_fwd(p, t)
         ref_lse[ref_lse == float("-inf")] = float("+inf")
         torch.cuda.synchronize()
+
+        should_print_precision = os.getenv("FLASHMLA_PRINT_PRECISION_DETAILS", "0") == "1" or p.num_runs > 0
+        if should_print_precision:
+            _print_precision_details(
+                "out",
+                prefill_ans_out,
+                ref_out_fp32,
+                abs_tol=8e-4,
+                rel_tol=3.01 / 128,
+                cos_diff_tol=7e-6,
+            )
+            _print_precision_details(
+                "max_logits",
+                prefill_ans_max_logits,
+                ref_max_logits,
+                abs_tol=1e-6,
+                rel_tol=2.01 / 65536,
+                cos_diff_tol=1e-7,
+            )
+            _print_precision_details(
+                "lse",
+                prefill_ans_lse,
+                ref_lse,
+                abs_tol=1e-6,
+                rel_tol=2.01 / 65536,
+                cos_diff_tol=1e-7,
+            )
 
         is_correct = True
         is_correct &= kk.check_is_allclose("out", prefill_ans_out.float(), ref_out_fp32, abs_tol=8e-4, rel_tol=3.01/128, cos_diff_tol=7e-6)
@@ -143,21 +238,7 @@ if __name__ == '__main__':
         ]
     ]
 
-    performance_case_templates = [
-        # V3.2
-        (576, 128, 2048, [8192, 32768, 65536, 98304, 131072]),
-        # MODEL1 CONFIG1
-        (512, 64, 512, [8192, 32768, 49152, 65536]),
-        # MODEL1 CONFIG2
-        (512, 128, 1024, [8192, 32768, 49152, 65536]),
-    ]
-
-    performance_cases = [
-        TestParam(s_q, s_kv, topk, h_q=h_q, d_qk=d_qk, have_attn_sink=True)
-        for (d_qk, h_q, topk, s_kv_list) in performance_case_templates
-        for s_q in [4096]
-        for s_kv in s_kv_list
-    ]
+    performance_cases = build_performance_cases()
 
     testcases = correctness_cases + correctness_cases_with_features + corner_cases + performance_cases
 

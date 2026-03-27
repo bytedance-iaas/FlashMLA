@@ -7,4 +7,7 @@ namespace sm90::fwd {
 template<int D_QK, bool HAVE_TOPK_LENGTH>
 void run_fwd_phase1_kernel(const SparseAttnFwdParams& params);
 
+template<int D_QK, bool HAVE_TOPK_LENGTH>
+void run_fwd_phase1_q8_kernel(const SparseAttnFwdQ8Params& params);
+
 }

@@ -211,6 +211,54 @@ def flash_mla_sparse_fwd(
     return results
 
 
+def flash_mla_sparse_q8kv8_fwd(
+    q: torch.Tensor,
+    kv: torch.Tensor,
+    indices: torch.Tensor,
+    sm_scale: float,
+    q_scale: torch.Tensor,
+    kv_scale: torch.Tensor,
+    d_v: int = 512,
+    attn_sink: Optional[torch.Tensor] = None,
+    topk_length: Optional[torch.Tensor] = None,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Sparse attention prefill API for q8kv8 inputs.
+
+    Args:
+        q: [s_q, h_q, d_qk], float8_e4m3fn
+        kv: [s_kv, h_kv, d_qk], float8_e4m3fn
+        indices: [s_q, h_kv, topk], int32
+        sm_scale: float
+        q_scale: scalar tensor (float32), per-tensor dequant scale for q
+        kv_scale: scalar tensor (float32), per-tensor dequant scale for kv
+        d_v: value dimension, currently only 512
+        attn_sink: optional [h_q], float32
+        topk_length: optional [s_q], int32
+
+    Returns:
+        (output, max_logits, lse)
+    """
+    # Keep user-side pipeline simple: coerce non-fp8 inputs to fp8_e4m3fn.
+    if q.dtype != torch.float8_e4m3fn:
+        q = q.to(torch.float8_e4m3fn)
+    if kv.dtype != torch.float8_e4m3fn:
+        kv = kv.to(torch.float8_e4m3fn)
+
+    results = flash_mla_cuda.sparse_prefill_q8kv8_fwd(
+        q,
+        kv,
+        indices,
+        sm_scale,
+        d_v,
+        q_scale,
+        kv_scale,
+        attn_sink,
+        topk_length,
+    )
+    return results
+
+
 def _flash_attn_varlen_forward(
     q: torch.Tensor,
     k: torch.Tensor,

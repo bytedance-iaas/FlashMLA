@@ -5,6 +5,8 @@
 #include "flashmla_utils.h"
 #include "../../helpers.h"
 
+#include <cuda_fp8.h>
+
 namespace sm90::fwd {
 
 using namespace cute;
@@ -37,6 +39,394 @@ void tma_bulk_reduce_add(void const* src_ptr, void* dst_ptr, int32_t store_bytes
                      :
                      : "l"(dst_ptr), "r"(smem_int_ptr), "r"(store_bytes)
                      : "memory");
+}
+
+CUTE_DEVICE
+float fp8_e4m3fn_to_float(uint8_t x) {
+    const __half_raw hraw = __nv_cvt_fp8_to_halfraw(static_cast<__nv_fp8_storage_t>(x), __NV_E4M3);
+    const __half h = *reinterpret_cast<const __half*>(&hraw);
+    return __half2float(h);
+}
+
+CUTE_DEVICE
+void fp8x4_e4m3fn_to_float(uint32_t packed, float& f0, float& f1, float& f2, float& f3) {
+    f0 = fp8_e4m3fn_to_float(static_cast<uint8_t>(packed & 0xff));
+    f1 = fp8_e4m3fn_to_float(static_cast<uint8_t>((packed >> 8) & 0xff));
+    f2 = fp8_e4m3fn_to_float(static_cast<uint8_t>((packed >> 16) & 0xff));
+    f3 = fp8_e4m3fn_to_float(static_cast<uint8_t>((packed >> 24) & 0xff));
+}
+
+static __global__ void sparse_attn_fwd_q8_direct_kernel(const SparseAttnFwdQ8Params params) {
+    const int row = blockIdx.x;
+    const int q_h_idx = row % params.h_q;
+    const int s_q_idx = row / params.h_q;
+    if (s_q_idx >= params.s_q) {
+        return;
+    }
+
+    extern __shared__ float smem[];
+    float* q_vec = smem;
+    float* logits = q_vec + 576;
+    float* weights = logits + params.topk;
+    int* kv_base_stage = reinterpret_cast<int*>(weights + params.topk);
+
+    __shared__ float s_max_logit;
+    __shared__ float s_inv_denom;
+    __shared__ float s_lse;
+    __shared__ int s_has_valid;
+    __shared__ int s_all_valid;
+    __shared__ float s_reduce[8];
+
+    const float q_scale = params.q_scale_ptr ? __ldg(params.q_scale_ptr) : params.q_scale;
+    const float kv_scale = params.kv_scale_ptr ? __ldg(params.kv_scale_ptr) : params.kv_scale;
+    const float q_prescale = q_scale * params.sm_scale * kv_scale;
+
+    const int q_base = s_q_idx * params.stride_q_s_q + q_h_idx * params.stride_q_h_q;
+    for (int d = threadIdx.x * 4; d < params.d_qk; d += blockDim.x * 4) {
+        if (d + 3 < params.d_qk) {
+            const uint32_t packed_q = __ldg(reinterpret_cast<const uint32_t*>(params.q + q_base + d));
+            float q0, q1, q2, q3;
+            fp8x4_e4m3fn_to_float(packed_q, q0, q1, q2, q3);
+            q_vec[d + 0] = q0 * q_prescale;
+            q_vec[d + 1] = q1 * q_prescale;
+            q_vec[d + 2] = q2 * q_prescale;
+            q_vec[d + 3] = q3 * q_prescale;
+        } else {
+            for (int d_tail = d; d_tail < params.d_qk; ++d_tail) {
+                q_vec[d_tail] = fp8_e4m3fn_to_float(__ldg(params.q + q_base + d_tail)) * q_prescale;
+            }
+        }
+    }
+    __syncthreads();
+
+    const int topk_length = params.topk_length ? __ldg(params.topk_length + s_q_idx) : params.topk;
+    const int topk_valid_len = max(0, min(topk_length, params.topk));
+    const int* idx_row = params.indices + s_q_idx * params.stride_indices_s_q;
+    if (threadIdx.x == 0) {
+        s_all_valid = (topk_valid_len == params.topk) ? 1 : 0;
+    }
+    __syncthreads();
+
+    for (int t = threadIdx.x; t < topk_valid_len; t += blockDim.x) {
+        const int token = __ldg(idx_row + t);
+        const bool valid = (token >= 0) && (token < params.s_kv);
+        if (!valid) {
+            s_all_valid = 0;
+        }
+    }
+    __syncthreads();
+
+    for (int t = threadIdx.x; t < topk_valid_len; t += blockDim.x) {
+        const int token = __ldg(idx_row + t);
+        const bool valid = (token >= 0) && (token < params.s_kv);
+        kv_base_stage[t] = valid ? (token * params.stride_kv_s_kv) : -1;
+    }
+    for (int t = topk_valid_len + threadIdx.x; t < params.topk; t += blockDim.x) {
+        kv_base_stage[t] = -1;
+    }
+    __syncthreads();
+
+    if (false && s_all_valid) {
+        for (int t = threadIdx.x; t < params.topk; t += blockDim.x) {
+            const int kv_base = kv_base_stage[t];
+            const uint8_t* kv_row = params.kv + kv_base;
+
+            float dot = 0.0f;
+            int d = 0;
+            for (; d + 3 < params.d_qk; d += 4) {
+                const uint32_t packed_kv = __ldg(reinterpret_cast<const uint32_t*>(kv_row + d));
+                float kv0, kv1, kv2, kv3;
+                fp8x4_e4m3fn_to_float(packed_kv, kv0, kv1, kv2, kv3);
+                dot = fmaf(q_vec[d + 0], kv0, dot);
+                dot = fmaf(q_vec[d + 1], kv1, dot);
+                dot = fmaf(q_vec[d + 2], kv2, dot);
+                dot = fmaf(q_vec[d + 3], kv3, dot);
+            }
+            for (; d < params.d_qk; ++d) {
+                const float kvd = fp8_e4m3fn_to_float(__ldg(kv_row + d));
+                dot = fmaf(q_vec[d], kvd, dot);
+            }
+            logits[t] = dot;
+        }
+    } else {
+        for (int t = threadIdx.x; t < params.topk; t += blockDim.x) {
+            const int kv_base = kv_base_stage[t];
+            if (kv_base < 0) {
+                logits[t] = -CUDART_INF_F;
+                continue;
+            }
+            const uint8_t* kv_row = params.kv + kv_base;
+
+            float dot = 0.0f;
+            int d = 0;
+            for (; d + 3 < params.d_qk; d += 4) {
+                const uint32_t packed_kv = __ldg(reinterpret_cast<const uint32_t*>(kv_row + d));
+                float kv0, kv1, kv2, kv3;
+                fp8x4_e4m3fn_to_float(packed_kv, kv0, kv1, kv2, kv3);
+                dot = fmaf(q_vec[d + 0], kv0, dot);
+                dot = fmaf(q_vec[d + 1], kv1, dot);
+                dot = fmaf(q_vec[d + 2], kv2, dot);
+                dot = fmaf(q_vec[d + 3], kv3, dot);
+            }
+            for (; d < params.d_qk; ++d) {
+                const float kvd = fp8_e4m3fn_to_float(__ldg(kv_row + d));
+                dot = fmaf(q_vec[d], kvd, dot);
+            }
+            logits[t] = dot;
+        }
+    }
+    __syncthreads();
+
+    float local_max = -CUDART_INF_F;
+    for (int t = threadIdx.x; t < params.topk; t += blockDim.x) {
+        local_max = max(local_max, logits[t]);
+    }
+    const unsigned full_mask = 0xffffffffu;
+    const int lane_id = threadIdx.x & 31;
+    const int warp_id = threadIdx.x >> 5;
+    const int num_warps = (blockDim.x + 31) >> 5;
+
+    float warp_max = local_max;
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        warp_max = max(warp_max, __shfl_down_sync(full_mask, warp_max, offset));
+    }
+    if (lane_id == 0) {
+        s_reduce[warp_id] = warp_max;
+    }
+    __syncthreads();
+
+    if (warp_id == 0) {
+        float block_max = (lane_id < num_warps) ? s_reduce[lane_id] : -CUDART_INF_F;
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            block_max = max(block_max, __shfl_down_sync(full_mask, block_max, offset));
+        }
+        if (lane_id == 0) {
+            s_max_logit = block_max;
+            s_has_valid = (block_max != -CUDART_INF_F) ? 1 : 0;
+        }
+    }
+    __syncthreads();
+
+    if (!s_has_valid) {
+        for (int t = threadIdx.x; t < params.topk; t += blockDim.x) {
+            weights[t] = 0.0f;
+        }
+        if (threadIdx.x == 0) {
+            s_lse = CUDART_INF_F;
+            s_inv_denom = 0.0f;
+        }
+    } else {
+        float local_sum = 0.0f;
+        for (int t = threadIdx.x; t < params.topk; t += blockDim.x) {
+            const float logit = logits[t];
+            const float w = (logit == -CUDART_INF_F) ? 0.0f : __expf(logit - s_max_logit);
+            weights[t] = w;
+            local_sum += w;
+        }
+
+        float warp_sum = local_sum;
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            warp_sum += __shfl_down_sync(full_mask, warp_sum, offset);
+        }
+        if (lane_id == 0) {
+            s_reduce[warp_id] = warp_sum;
+        }
+        __syncthreads();
+
+        if (warp_id == 0) {
+            float block_sum = (lane_id < num_warps) ? s_reduce[lane_id] : 0.0f;
+            for (int offset = 16; offset > 0; offset >>= 1) {
+                block_sum += __shfl_down_sync(full_mask, block_sum, offset);
+            }
+            if (lane_id == 0) {
+                const float sum_exp = block_sum;
+                const float attn_sink = params.attn_sink ? params.attn_sink[q_h_idx] : -CUDART_INF_F;
+                const float sink_term = __expf(attn_sink - s_max_logit);
+                const float denom = sum_exp + sink_term;
+                s_inv_denom = denom > 0.0f ? 1.0f / denom : 0.0f;
+                s_lse = logf(max(denom, 1e-30f)) + s_max_logit;
+            }
+        }
+        __syncthreads();
+
+        for (int t = threadIdx.x; t < params.topk; t += blockDim.x) {
+            weights[t] *= (s_inv_denom * kv_scale);
+        }
+    }
+    __syncthreads();
+
+    const int out_base = (s_q_idx * params.h_q + q_h_idx) * params.d_v;
+    if (!s_has_valid) {
+        for (int dv_idx = threadIdx.x * 4; dv_idx < params.d_v; dv_idx += blockDim.x * 4) {
+            if (dv_idx + 3 < params.d_v) {
+                params.out[out_base + dv_idx + 0] = static_cast<bf16>(0.0f);
+                params.out[out_base + dv_idx + 1] = static_cast<bf16>(0.0f);
+                params.out[out_base + dv_idx + 2] = static_cast<bf16>(0.0f);
+                params.out[out_base + dv_idx + 3] = static_cast<bf16>(0.0f);
+            } else {
+                for (int d_tail = dv_idx; d_tail < params.d_v; ++d_tail) {
+                    params.out[out_base + d_tail] = static_cast<bf16>(0.0f);
+                }
+            }
+        }
+    } else if (false && s_all_valid) {
+        for (int dv_idx = threadIdx.x * 4; dv_idx < params.d_v; dv_idx += blockDim.x * 4) {
+            if (dv_idx + 3 < params.d_v) {
+                float out0 = 0.0f;
+                float out1 = 0.0f;
+                float out2 = 0.0f;
+                float out3 = 0.0f;
+                int t = 0;
+                for (; t + 1 < params.topk; t += 2) {
+                    const float w0 = weights[t + 0];
+                    if (w0 != 0.0f) {
+                        const int kv_base0 = kv_base_stage[t + 0];
+                        const uint8_t* kv_row0 = params.kv + kv_base0;
+                        const uint32_t packed_kv0 = __ldg(reinterpret_cast<const uint32_t*>(kv_row0 + dv_idx));
+                        float kv00, kv01, kv02, kv03;
+                        fp8x4_e4m3fn_to_float(packed_kv0, kv00, kv01, kv02, kv03);
+                        out0 = fmaf(w0, kv00, out0);
+                        out1 = fmaf(w0, kv01, out1);
+                        out2 = fmaf(w0, kv02, out2);
+                        out3 = fmaf(w0, kv03, out3);
+                    }
+
+                    const float w1 = weights[t + 1];
+                    if (w1 != 0.0f) {
+                        const int kv_base1 = kv_base_stage[t + 1];
+                        const uint8_t* kv_row1 = params.kv + kv_base1;
+                        const uint32_t packed_kv1 = __ldg(reinterpret_cast<const uint32_t*>(kv_row1 + dv_idx));
+                        float kv10, kv11, kv12, kv13;
+                        fp8x4_e4m3fn_to_float(packed_kv1, kv10, kv11, kv12, kv13);
+                        out0 = fmaf(w1, kv10, out0);
+                        out1 = fmaf(w1, kv11, out1);
+                        out2 = fmaf(w1, kv12, out2);
+                        out3 = fmaf(w1, kv13, out3);
+                    }
+                }
+                for (; t < params.topk; ++t) {
+                    const float w = weights[t];
+                    if (w == 0.0f) {
+                        continue;
+                    }
+                    const int kv_base = kv_base_stage[t];
+                    const uint8_t* kv_row = params.kv + kv_base;
+                    const uint32_t packed_kv = __ldg(reinterpret_cast<const uint32_t*>(kv_row + dv_idx));
+                    float kv0, kv1, kv2, kv3;
+                    fp8x4_e4m3fn_to_float(packed_kv, kv0, kv1, kv2, kv3);
+                    out0 = fmaf(w, kv0, out0);
+                    out1 = fmaf(w, kv1, out1);
+                    out2 = fmaf(w, kv2, out2);
+                    out3 = fmaf(w, kv3, out3);
+                }
+                params.out[out_base + dv_idx + 0] = static_cast<bf16>(out0);
+                params.out[out_base + dv_idx + 1] = static_cast<bf16>(out1);
+                params.out[out_base + dv_idx + 2] = static_cast<bf16>(out2);
+                params.out[out_base + dv_idx + 3] = static_cast<bf16>(out3);
+            } else {
+                for (int d_tail = dv_idx; d_tail < params.d_v; ++d_tail) {
+                    float out_val = 0.0f;
+                    for (int t = 0; t < params.topk; ++t) {
+                        const float w = weights[t];
+                        if (w == 0.0f) {
+                            continue;
+                        }
+                        const int kv_base = kv_base_stage[t];
+                        const uint8_t* kv_row = params.kv + kv_base;
+                        const float kvv = fp8_e4m3fn_to_float(__ldg(kv_row + d_tail));
+                        out_val = fmaf(w, kvv, out_val);
+                    }
+                    params.out[out_base + d_tail] = static_cast<bf16>(out_val);
+                }
+            }
+        }
+    } else {
+        for (int dv_idx = threadIdx.x * 4; dv_idx < params.d_v; dv_idx += blockDim.x * 4) {
+            if (dv_idx + 3 < params.d_v) {
+                float out0 = 0.0f;
+                float out1 = 0.0f;
+                float out2 = 0.0f;
+                float out3 = 0.0f;
+                int t = 0;
+                for (; t + 1 < params.topk; t += 2) {
+                    const float w0 = weights[t + 0];
+                    if (w0 != 0.0f) {
+                        const int kv_base0 = kv_base_stage[t + 0];
+                        if (kv_base0 >= 0) {
+                            const uint8_t* kv_row0 = params.kv + kv_base0;
+                            const uint32_t packed_kv0 = __ldg(reinterpret_cast<const uint32_t*>(kv_row0 + dv_idx));
+                            float kv00, kv01, kv02, kv03;
+                            fp8x4_e4m3fn_to_float(packed_kv0, kv00, kv01, kv02, kv03);
+                            out0 = fmaf(w0, kv00, out0);
+                            out1 = fmaf(w0, kv01, out1);
+                            out2 = fmaf(w0, kv02, out2);
+                            out3 = fmaf(w0, kv03, out3);
+                        }
+                    }
+
+                    const float w1 = weights[t + 1];
+                    if (w1 != 0.0f) {
+                        const int kv_base1 = kv_base_stage[t + 1];
+                        if (kv_base1 >= 0) {
+                            const uint8_t* kv_row1 = params.kv + kv_base1;
+                            const uint32_t packed_kv1 = __ldg(reinterpret_cast<const uint32_t*>(kv_row1 + dv_idx));
+                            float kv10, kv11, kv12, kv13;
+                            fp8x4_e4m3fn_to_float(packed_kv1, kv10, kv11, kv12, kv13);
+                            out0 = fmaf(w1, kv10, out0);
+                            out1 = fmaf(w1, kv11, out1);
+                            out2 = fmaf(w1, kv12, out2);
+                            out3 = fmaf(w1, kv13, out3);
+                        }
+                    }
+                }
+                for (; t < params.topk; ++t) {
+                    const float w = weights[t];
+                    if (w == 0.0f) {
+                        continue;
+                    }
+                    const int kv_base = kv_base_stage[t];
+                    if (kv_base < 0) {
+                        continue;
+                    }
+                    const uint8_t* kv_row = params.kv + kv_base;
+                    const uint32_t packed_kv = __ldg(reinterpret_cast<const uint32_t*>(kv_row + dv_idx));
+                    float kv0, kv1, kv2, kv3;
+                    fp8x4_e4m3fn_to_float(packed_kv, kv0, kv1, kv2, kv3);
+                    out0 = fmaf(w, kv0, out0);
+                    out1 = fmaf(w, kv1, out1);
+                    out2 = fmaf(w, kv2, out2);
+                    out3 = fmaf(w, kv3, out3);
+                }
+                params.out[out_base + dv_idx + 0] = static_cast<bf16>(out0);
+                params.out[out_base + dv_idx + 1] = static_cast<bf16>(out1);
+                params.out[out_base + dv_idx + 2] = static_cast<bf16>(out2);
+                params.out[out_base + dv_idx + 3] = static_cast<bf16>(out3);
+            } else {
+                for (int d_tail = dv_idx; d_tail < params.d_v; ++d_tail) {
+                    float out_val = 0.0f;
+                    for (int t = 0; t < params.topk; ++t) {
+                        const float w = weights[t];
+                        if (w == 0.0f) {
+                            continue;
+                        }
+                        const int kv_base = kv_base_stage[t];
+                        if (kv_base < 0) {
+                            continue;
+                        }
+                        const uint8_t* kv_row = params.kv + kv_base;
+                        const float kvv = fp8_e4m3fn_to_float(__ldg(kv_row + d_tail));
+                        out_val = fmaf(w, kvv, out_val);
+                    }
+                    params.out[out_base + d_tail] = static_cast<bf16>(out_val);
+                }
+            }
+        }
+    }
+
+    if (threadIdx.x == 0) {
+        params.max_logits[s_q_idx * params.h_q + q_h_idx] = s_max_logit;
+        params.lse[s_q_idx * params.h_q + q_h_idx] = s_lse;
+    }
 }
 
 template<int D_QK, bool HAVE_TOPK_LENGTH>
@@ -76,10 +466,8 @@ __device__ void KernelTemplate<D_QK, HAVE_TOPK_LENGTH>::devfunc(const SparseAttn
     }
 
     __syncthreads();
-    
     const int topk_length = HAVE_TOPK_LENGTH ? __ldg(params.topk_length + s_q_idx) : params.topk;
     const int num_topk_blocks = HAVE_TOPK_LENGTH ? ku::ceil_div(topk_length, (int)B_TOPK) : (int)((unsigned int)params.topk/(unsigned int)B_TOPK);
-
     if (warpgroup_idx == 0 || warpgroup_idx == 1) {
         cutlass::arch::warpgroup_reg_alloc<216>();
 
@@ -99,12 +487,12 @@ __device__ void KernelTemplate<D_QK, HAVE_TOPK_LENGTH>::devfunc(const SparseAttn
         Tensor rP = partition_fragment_C(TiledMMA_QK{}, Shape<Int<B_H>, Int<B_TOPK>>{});
         Tensor rS = make_tensor<bf16>(partition_shape_A(TiledMMA_PV_LocalP{}, Shape<Int<B_H>, Int<B_TOPK>>{}));
         cute::fill(rO, 0.0f);
-        
+
         // Wait for Q
         plan.bar_q.wait(0);
 
         bool cur_bar_wait_phase = 0;
-        
+
         struct Warpgroup0 {};
         struct Warpgroup1 {};
 
@@ -641,6 +1029,23 @@ void KernelTemplate<D_QK, HAVE_TOPK_LENGTH>::run(const SparseAttnFwdParams &para
 template<int D_QK, bool HAVE_TOPK_LENGTH>
 void run_fwd_phase1_kernel(const SparseAttnFwdParams& params) {
     KernelTemplate<D_QK, HAVE_TOPK_LENGTH>::run(params);
+}
+
+template<int D_QK, bool HAVE_TOPK_LENGTH>
+struct KernelTemplateQ8 {
+    static void run(const SparseAttnFwdQ8Params& params) {
+        constexpr int kThreads = 128;
+        const int grid = params.s_q * params.h_q;
+        const size_t smem_bytes = sizeof(float) * (576 + 2 * params.topk)
+                                + sizeof(int) * params.topk;
+        sparse_attn_fwd_q8_direct_kernel<<<grid, kThreads, smem_bytes, params.stream>>>(params);
+        KU_CHECK_KERNEL_LAUNCH();
+    }
+};
+
+template<int D_QK, bool HAVE_TOPK_LENGTH>
+void run_fwd_phase1_q8_kernel(const SparseAttnFwdQ8Params& params) {
+    KernelTemplateQ8<D_QK, HAVE_TOPK_LENGTH>::run(params);
 }
 
 }

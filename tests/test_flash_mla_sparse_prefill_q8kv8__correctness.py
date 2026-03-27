@@ -7,6 +7,12 @@ from typing import List, Optional, Tuple
 import pytest
 import torch
 
+# Ensure direct script execution uses the in-repo flash_mla package.
+_THIS_DIR = os.path.dirname(os.path.abspath(__file__))
+_REPO_ROOT = os.path.dirname(_THIS_DIR)
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
+
 import flash_mla
 
 

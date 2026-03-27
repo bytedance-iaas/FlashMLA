@@ -2,6 +2,11 @@ import os
 import sys
 import time
 
+_THIS_DIR = os.path.dirname(os.path.abspath(__file__))
+_REPO_ROOT = os.path.dirname(_THIS_DIR)
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
+
 import torch
 import kernelkit as kk
 
@@ -176,6 +181,12 @@ if __name__ == "__main__":
             next(c for c in perf_cases if c.d_qk == 512 and c.h_q == 64 and c.topk == 512),
             next(c for c in perf_cases if c.d_qk == 512 and c.h_q == 128 and c.topk == 1024),
         ]
+
+    # For iteration-stage debugging, prioritize turnaround over stable perf averages.
+    default_num_runs = 1 if level == "quick" else 10
+    num_runs = int(os.getenv("FLASHMLA_Q8KV8_PERF_NUM_RUNS", str(default_num_runs)))
+    for case in perf_cases:
+        case.num_runs = num_runs
 
     is_no_cooldown = lib.is_no_cooldown()
     failed_cases = []

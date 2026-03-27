@@ -154,6 +154,9 @@ if __name__ == '__main__':
     torch.cuda.set_device(device)
     torch.set_float32_matmul_precision('high')
 
+    mode = os.getenv("FLASHMLA_Q16_MODE", "all").strip().lower()
+    perf_level = os.getenv("FLASHMLA_Q16_PERF_LEVEL", "full").strip().lower()
+
     correctness_cases = [
         # Regular shapes
         TestParam(s_q, s_kv, topk, h_q=h_q, num_runs=0, d_qk=d_qk)
@@ -239,8 +242,24 @@ if __name__ == '__main__':
     ]
 
     performance_cases = build_performance_cases()
+    if perf_level == "quick":
+        # Match q8 quick perf selection so q16/q8 outputs are directly comparable.
+        performance_cases = [
+            next(c for c in performance_cases if c.d_qk == 576 and c.h_q == 128 and c.topk == 2048),
+            next(c for c in performance_cases if c.d_qk == 512 and c.h_q == 64 and c.topk == 512),
+            next(c for c in performance_cases if c.d_qk == 512 and c.h_q == 128 and c.topk == 1024),
+        ]
 
-    testcases = correctness_cases + correctness_cases_with_features + corner_cases + performance_cases
+    # For iteration-stage debugging, prioritize turnaround over stable perf averages.
+    default_num_runs = 1 if perf_level == "quick" else 10
+    perf_num_runs = int(os.getenv("FLASHMLA_Q16_PERF_NUM_RUNS", str(default_num_runs)))
+    for case in performance_cases:
+        case.num_runs = perf_num_runs
+
+    if mode == "perf":
+        testcases = performance_cases
+    else:
+        testcases = correctness_cases + correctness_cases_with_features + corner_cases + performance_cases
 
     is_no_cooldown = lib.is_no_cooldown()
     failed_cases = []

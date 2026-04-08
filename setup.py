@@ -87,6 +87,10 @@ ext_modules.append(
             "csrc/sm90/prefill/sparse/instantiations/phase1_k576.cu",
             "csrc/sm90/prefill/sparse/instantiations/phase1_k576_topklen.cu",
 
+            # sm90 sparse prefill -- q8 native fp8 WGMMA
+            "csrc/sm90/prefill/sparse/instantiations/phase1_q8_new_k512.cu",
+            "csrc/sm90/prefill/sparse/instantiations/phase1_q8_new_k576.cu",
+
             # sm100 dense prefill & backward
             "csrc/sm100/prefill/dense/fmha_cutlass_fwd_sm100.cu",
             "csrc/sm100/prefill/dense/fmha_cutlass_bwd_sm100.cu",

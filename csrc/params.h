@@ -195,6 +195,8 @@ struct SparseAttnFwdQ8Params {
     cudaStream_t stream;
 };
 
+using SparseAttnFwdQ8SM90NewParams = SparseAttnFwdQ8Params;
+
 // We have some kernels that implement both prefill and decode modes in a single kernel (with different template instantiations). The following enum helps to distinguish the modes.
 enum class SparseAttnFwdMode {
     Prefill,            // Normal prefill mode

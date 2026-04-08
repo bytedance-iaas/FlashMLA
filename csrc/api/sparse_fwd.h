@@ -9,6 +9,7 @@
 #include "params.h"
 
 #include "sm90/prefill/sparse/phase1.h"
+#include "sm90/prefill/sparse/phase1_q8_new.h"
 #include "sm100/prefill/sparse/fwd/head128/phase1.h"
 #include "sm100/prefill/sparse/fwd/head64/phase1.h"
 #include "sm100/prefill/sparse/fwd_for_small_topk/head128/phase1.h"
@@ -381,7 +382,7 @@ static std::vector<at::Tensor> sparse_attn_prefill_q8kv8_interface(
     if (is_sm90a) {
         DISPATCH_HEAD_DIM(d_qk, HEAD_DIM_QK, [&]() {
             DISPATCH_BOOLEAN_FLAG(topk_length.has_value(), HAVE_TOPK_LENGTH, [&]() {
-                sm90::fwd::run_fwd_phase1_q8_kernel<HEAD_DIM_QK, HAVE_TOPK_LENGTH>(q8_params);
+                sm90::fwd::run_fwd_phase1_q8_sm90_new_kernel<HEAD_DIM_QK, HAVE_TOPK_LENGTH>(q8_params);
             });
         });
         return {out, max_logits, lse};
